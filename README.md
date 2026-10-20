@@ -97,3 +97,8 @@ for lv in 1 2 3; do for s in $(seq 1 8); do ./tank --mode 2 --level $lv --seed $
 ./tank --mode 2 --seed 4 --shot 6300 shots/action.ppm   # 对战中：炮弹飞行 + 拖尾
 convert shots/action.ppm shots/action.png
 ```
+
+## 8. 许可证
+
+本项目采用 [MIT License](LICENSE)，Copyright © 2026
+[Jason-Pu-Junhao](https://github.com/Jason-Pu-Junhao)。
