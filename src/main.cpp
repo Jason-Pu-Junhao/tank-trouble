@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>
 
@@ -35,6 +36,8 @@ void usage() {
         "  --fps <n>         渲染帧率上限（默认 60）\n"
         "  --sound           打开开炮/爆炸提示音（XBell）\n"
         "  --shot <帧数> <文件.ppm>   无窗口跑固定帧数后截图\n"
+        "  --frames <总帧数> <步长> <目录>  无窗口导出动画帧（用于制作 GIF）\n"
+        "  --start <物理帧数>  与 --frames 配合，跳过开头若干帧再开始导出\n"
         "  --sim <秒数>      无窗口自动对局，结束后打印比分/回合数/每回合耗时\n"
         "  --help            显示本帮助\n"
         "操作: P1 = W/A/S/D + 空格;  P2 = 方向键 + 回车;  P 暂停;  R 重开;  ESC 退出\n");
@@ -111,6 +114,49 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("已保存截图: %s (%d 帧物理后)\n", shot_file, shot_frames);
+        return 0;
+    }
+
+    // ---- 动画帧导出模式：无窗口跑 N 帧物理，每 step 帧存一张 PPM（拿去合成 GIF）----
+    // 用法: --frames <总帧数> <步长> <输出目录>
+    const char* frames_dir = nullptr;
+    int frames_total = 0, frames_step = 1;
+    const int frames_start = arg_int(argc, argv, "--start", 0);
+    for (int i = 1; i + 3 < argc; ++i)
+        if (std::strcmp(argv[i], "--frames") == 0) {
+            frames_total = std::atoi(argv[i + 1]);
+            frames_step = std::atoi(argv[i + 2]);
+            frames_dir = argv[i + 3];
+        }
+    if (frames_dir) {
+        if (frames_total <= 0) frames_total = 300;
+        if (frames_step <= 0) frames_step = 4;
+        cfg.mode = arg_int(argc, argv, "--mode", 2);
+        std::error_code ec;
+        std::filesystem::create_directories(frames_dir, ec);
+        if (ec) {
+            std::fprintf(stderr, "创建目录失败: %s\n", frames_dir);
+            return 1;
+        }
+        Game game(cfg);
+        Canvas cv(cfg.cols * cfg.cell, cfg.rows * cfg.cell, "tank", /*visible=*/false);
+        const double step = 1.0 / 120.0;
+        for (int i = 0; i < frames_start; ++i) game.update(step);   // 跳过开头，直接截取精彩片段
+        int saved = 0;
+        for (int i = 0; i < frames_total; ++i) {
+            game.update(step);
+            if (i % frames_step != 0) continue;
+            game.render(cv);
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/f%04d.ppm", frames_dir, saved);
+            if (!cv.save_ppm(path)) {
+                std::fprintf(stderr, "写入失败: %s\n", path);
+                return 1;
+            }
+            ++saved;
+        }
+        std::printf("已导出 %d 帧到 %s（从第 %d 帧物理开始，每 %d 帧取 1 帧）\n",
+                    saved, frames_dir, frames_start, frames_step);
         return 0;
     }
 

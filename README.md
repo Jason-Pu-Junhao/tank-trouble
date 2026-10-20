@@ -3,7 +3,9 @@
 > 《程序设计思想与方法（C++）》第一章作业 第五题（奖励题）项目
 > 纯 C++17 + Xlib 实现，**零第三方依赖**（不需要 SDL/SFML/Qt），在 Linux 桌面上直接编译运行。
 
-![对局截图](shots/action.png)
+![演示：两辆 AI 坦克互殴](shots/demo.gif)
+
+*（上图是 4 秒的对局循环：炮弹撞墙反弹、拖尾、命中得分、进入下一局）*
 
 ---
 
@@ -40,6 +42,8 @@ make            # 生成可执行文件 ./tank
 | `--sound` | 打开 XBell 音效（开炮/爆炸提示音） |
 | `--sim N` | 无窗口自动对局 N 秒，打印比分与统计（用来测试 AI） |
 | `--shot <帧数> <文件.ppm>` | 无窗口跑固定帧数后截图（写作业文档用的自动截图） |
+| `--frames <总帧数> <步长> <目录>` | 无窗口导出动画帧（每「步长」帧物理存一张 PPM），用于制作 GIF |
+| `--start <物理帧数>` | 配合 `--frames`，跳过开头若干帧，直接截取精彩片段 |
 
 ## 3. 操作
 
@@ -91,12 +95,22 @@ for lv in 1 2 3; do for s in $(seq 1 8); do ./tank --mode 2 --level $lv --seed $
 
 ## 7. 截图
 
-`shots/` 目录下的 PNG 由 `--shot` 自动生成（无需人工截屏）：
+`shots/` 里的 PNG 由 `--shot` 自动生成，`demo.gif` 由 `--frames` 导出的序列合成，
+整个过程不需要人工截屏：
 
 ```bash
-./tank --mode 2 --seed 4 --shot 6300 shots/action.ppm   # 对战中：炮弹飞行 + 拖尾
+# 单张截图
+./tank --mode 2 --seed 4 --shot 6300 shots/action.ppm
 convert shots/action.ppm shots/action.png
+
+# 连续动画帧 -> GIF（从第 1950 帧物理开始截 480 帧，每 4 帧取 1 张 = 4 秒）
+./tank --mode 2 --seed 13 --start 1950 --frames 480 4 shots/frames
+mogrify -path tmp -resize 640x480 -dither None -colors 32 shots/frames/*.ppm
+convert -delay 3 -loop 0 tmp/*.ppm -layers Optimize shots/demo.gif
 ```
+
+> 关键参数：`-dither None -colors 32`。游戏本身只有十几种纯色，不去抖动、只量化到
+> 32 色，GIF 从 4.6 MB 降到 **588 KB**，画面几乎没有损失。
 
 ## 8. 许可证
 
