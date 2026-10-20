@@ -1,0 +1,13 @@
+# 构建产物
+*.o
+tank
+build/
+
+# 自动截图产生的中间文件（保留 .png 示例图）
+*.ppm
+
+# 编辑器/系统文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
