@@ -22,7 +22,7 @@
 
 ```bash
 sudo apt install g++ libx11-dev make      # 只需要这三样（绝大多数桌面发行版已自带）
-cd q5_tank
+# 在仓库根目录下：
 make            # 生成可执行文件 ./tank
 ./tank          # 人机对战（默认）
 ```
@@ -53,7 +53,7 @@ make            # 生成可执行文件 ./tank
 ## 4. 代码结构
 
 ```
-q5_tank/
+tank-trouble/
 ├── Makefile
 └── src/
     ├── canvas.hpp / canvas.cpp   X11 双缓冲画布 + 内置 5x7 点阵字体（绘制层）
