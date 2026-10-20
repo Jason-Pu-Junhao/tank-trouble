@@ -85,9 +85,10 @@ int main(int argc, char** argv) {
         std::printf("[sim] 比分 P1=%d P2=%d   已进行 %d 回合   平均每回合 %.2f 秒\n",
                     game.score(Side::P1), game.score(Side::P2), game.round_no(),
                     game.round_no() ? game.elapsed() / game.round_no() : 0.0);
-        std::printf("[sim] 比赛结束=%s  阵亡次数 P1=%d P2=%d\n",
+        std::printf("[sim] 比赛结束=%s  阵亡次数 P1=%d P2=%d  自杀=%d  反弹球=%d\n",
                     game.match_over() ? "是" : "否（超时）",
-                    game.deaths_of(Side::P1), game.deaths_of(Side::P2));
+                    game.deaths_of(Side::P1), game.deaths_of(Side::P2),
+                    game.self_kills(), game.bank_shots());
         return 0;
     }
 

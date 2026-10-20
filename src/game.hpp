@@ -88,6 +88,25 @@ struct AiBrain {
     double strafe_t = 0;          // 走位计时
     double strafe_dir = 1;        // 绕行方向
     double fire_delay = 0;        // 反应延迟
+
+    // --- 真预判：用最近几帧的位移估计对手速度 ---
+    Vec2   foe_last;
+    Vec2   foe_vel;
+    double foe_sample_t = 0;
+    bool   foe_init = false;
+
+    // --- BFS 寻路：每格到对手的步数，以及下一步该往哪走 ---
+    std::vector<int> dist_grid;
+    int    path_cells = -1;       // 我在网格上到对手的实际步数（-1 = 不可达）
+    Vec2   step_dir;              // 沿最短路的下一个方向
+
+    // --- 反弹射线：找到的可用开火角（每 0.15 秒重新搜索一次）---
+    double aim_scan_t = 0;
+    bool   bank_ok = false;
+    double bank_ang = 0;
+
+    // --- 自伤风险 ---
+    bool   self_harm = false;
     // --- 防卡死：周期性检查"想走却几乎没动"，就强制打方向脱困 ---
     Vec2   last_pos;
     double move_check_t = 0;
@@ -128,6 +147,8 @@ public:
     int  round_no() const { return round_; }
     double elapsed() const { return match_time_; }
     int  deaths_of(Side s) const { return tanks_[(int)s - 1].deaths; }
+    int  self_kills() const { return self_kills_; }     // 被自己的反弹球打死的次数
+    int  bank_shots() const { return bank_shots_; }     // 打出"反弹球"的次数
     Phase phase() const { return phase_; }
     // 供无头自动截图使用：直接跳到对战画面
     void set_demo(bool on) { demo_ = on; }
@@ -143,6 +164,10 @@ private:
     void  update_tank(Tank& t, double dt);
     void  update_bullets(double dt);
     void  update_ai(Tank& t, const Tank& foe, double dt);
+    void  bfs_from(int sx, int sy, std::vector<int>& dist) const;   // 网格 BFS
+    // 射线：撞墙镜面反射，最多 max_bounces 次；命中 target 返回路程长度，否则 -1
+    double raycast(Vec2 origin, Vec2 dir, int max_bounces, Vec2 target,
+                   double hit_r, double max_len, int* used_bounces) const;
     void  collapse_walls(int pairs);          // 僵局时拆墙：让场地逐渐打开
     bool  line_clear(Vec2 a, Vec2 b) const;   // 两点之间是否没有墙
     void  add_screen_shake(double amount) { shake_ = std::max(shake_, amount); }
@@ -168,6 +193,7 @@ private:
     double sd_timer_ = 0;                     // 僵局拆墙计时
     bool   sudden_death_ = false;
     int    beeps_ = 0, booms_ = 0;
+    int    self_kills_ = 0, bank_shots_ = 0;
 
     friend struct GameTestAccess;
 };

@@ -442,6 +442,7 @@ void Game::update_bullets(double dt) {
                 if (!t.alive || t.invuln > 0) continue;
                 const Vec2 d = b.pos - t.pos;
                 if (dot(d, d) > (kTankR + kBulletR) * (kTankR + kBulletR)) continue;
+                if (b.owner == t.side) ++self_kills_;   // 被自己的反弹球打死
                 kill_tank(t);
                 b.alive = false;
                 died[(int)t.side] = true;
@@ -486,27 +487,116 @@ void Game::update_bullets(double dt) {
 
 // ============================== 电脑玩家 ==============================
 // 决策周期 + 比例控制 + 简单的"预判瞄准"和"躲子弹"，难度由 ai_level 决定。
+
+// ============================== AI 辅助算法 ==============================
+// 网格 BFS：从 (sx,sy) 出发，算出每个空格到它的步数（-1 表示墙或不可达）
+void Game::bfs_from(int sx, int sy, std::vector<int>& dist) const {
+    const int C = cfg_.cols, R = cfg_.rows;
+    dist.assign((size_t)C * R, -1);
+    if (sx < 0 || sy < 0 || sx >= C || sy >= R) return;
+    if (cells_[(size_t)sy * C + sx]) return;
+    std::vector<int> q;
+    q.reserve((size_t)C * R);
+    dist[(size_t)sy * C + sx] = 0;
+    q.push_back(sy * C + sx);
+    for (size_t h = 0; h < q.size(); ++h) {
+        const int cur = q[h], x = cur % C, y = cur / C;
+        const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+        for (int d = 0; d < 4; ++d) {
+            const int nx = x + dx[d], ny = y + dy[d];
+            if (nx < 0 || ny < 0 || nx >= C || ny >= R) continue;
+            const int ni = ny * C + nx;
+            if (cells_[(size_t)ni] || dist[(size_t)ni] >= 0) continue;
+            dist[(size_t)ni] = dist[(size_t)cur] + 1;
+            q.push_back(ni);
+        }
+    }
+}
+
+// 射线：撞墙做镜面反射（最多 max_bounces 次），若与 target 的距离 ≤ hit_r，
+// 返回累计走过的路程长度；否则返回 -1。用来做"反弹球能不能打到人"的判断。
+double Game::raycast(Vec2 origin, Vec2 dir, int max_bounces, Vec2 target,
+                     double hit_r, double max_len, int* used_bounces) const {
+    const int C = cfg_.cols, R = cfg_.rows;
+    const double cs = cfg_.cell;
+    const double step = std::max(2.0, cs * 0.1);
+    Vec2 v = norm(dir);
+    Vec2 p = origin;
+    int bounces = 0;
+    double travelled = 0;
+    const int max_steps = (int)(max_len / step) + 2;
+    auto solid = [&](int x, int y) {
+        if (x < 0 || y < 0 || x >= C || y >= R) return true;
+        return cells_[(size_t)y * C + x] != 0;
+    };
+    if (solid((int)(p.x / cs), (int)(p.y / cs))) return -1;   // 起点在墙里
+    for (int i = 0; i < max_steps; ++i) {
+        if (len(p - target) <= hit_r) { if (used_bounces) *used_bounces = bounces; return travelled; }
+        const Vec2 np = p + v * step;
+        travelled += step;
+        if (travelled > max_len) break;
+        const int cx = (int)(np.x / cs), cy = (int)(np.y / cs);
+        if (!solid(cx, cy)) { p = np; continue; }
+        // 撞墙：分轴判断是哪一面（支持墙角），然后镜像反射
+        if (bounces >= max_bounces) break;
+        const int px = (int)(p.x / cs), py = (int)(p.y / cs);
+        const bool hit_x = (cx != px) && solid(cx, py);
+        const bool hit_y = (cy != py) && solid(px, cy);
+        if (hit_x) v.x = -v.x;
+        if (hit_y) v.y = -v.y;
+        if (!hit_x && !hit_y) { v.x = -v.x; v.y = -v.y; }     // 正对墙角
+        ++bounces;
+        // p 保持不动（它仍在空地上），下一轮沿反射后的方向重新前进
+        travelled -= step;
+    }
+    return -1;
+}
+
 void Game::update_ai(Tank& me, const Tank& foe, double dt) {
     AiBrain& br = brain_[me.side == Side::P1 ? 0 : 1];
     br.think -= dt;
     br.strafe_t -= dt;
     br.fire_delay -= dt;
+    br.aim_scan_t -= dt;
 
-    const double lvl = (cfg_.ai_level == 1) ? 0.0 : (cfg_.ai_level == 2 ? 1.0 : 2.0);
+    // 难度决定"启用哪些智能行为"，同时决定误差与反应时间
+    const int lvl = std::max(1, std::min(3, cfg_.ai_level));
+    const bool use_lead = lvl >= 2;      // 真预判
+    const bool use_path = lvl >= 2;      // BFS 寻路
+    const bool use_self = lvl >= 2;      // 自伤风险检查
+    const bool use_bank = lvl >= 3;      // 反弹射线
+    const double aim_noise = 0.22 - 0.06 * (lvl - 1);   // 0.22 / 0.16 / 0.10
+    const double reaction  = 0.50 - 0.12 * (lvl - 1);   // 0.50 / 0.38 / 0.26
 
-    // --- 0) 防卡死：每 0.35 秒检查一次"想走却几乎没动"，连续两次就强制脱困 0.7 秒 ---
+    // --- 0) 用最近几帧的位移估计对手速度（真预判的数据来源）---
+    if (!br.foe_init) { br.foe_last = foe.pos; br.foe_init = true; }
+    br.foe_sample_t += dt;
+    if (br.foe_sample_t >= 0.10) {
+        Vec2 v = (foe.pos - br.foe_last) * (1.0 / br.foe_sample_t);
+        if (len(v) > cfg_.tank_speed * 1.5) v = norm(v) * (cfg_.tank_speed * 1.5);
+        br.foe_vel = br.foe_vel * 0.5 + v * 0.5;          // 一阶平滑，避免抖动
+        br.foe_last = foe.pos;
+        br.foe_sample_t = 0;
+    }
+
+    // --- 1) 防卡死：每 0.35 秒检查一次"想走却几乎没动"，连续两次就强制脱困 0.7 秒 ---
     br.move_check_t -= dt;
     if (br.move_check_t <= 0) {
         const double moved = len(me.pos - br.last_pos);
-        if (me.drive != 0 && moved < 2.0) { if (++br.stuck >= 2) { br.unstick_t = 0.7; br.unstick_dir = (rng_() % 2) ? 1.0 : -1.0; br.stuck = 0; } }
-        else br.stuck = 0;
+        if (me.drive != 0 && moved < 2.0) {
+            if (++br.stuck >= 2) {
+                br.unstick_t = 0.7;
+                br.unstick_dir = (rng_() % 2) ? 1.0 : -1.0;
+                br.stuck = 0;
+            }
+        } else {
+            br.stuck = 0;
+        }
         br.last_pos = me.pos;
         br.move_check_t = 0.35;
     }
-    const double aim_noise = 0.22 - 0.06 * lvl;      // 瞄准抖动
-    const double reaction  = 0.50 - 0.12 * lvl;      // 反应延迟
 
-    // --- 1) 躲子弹：预测每颗来袭子弹未来 0.45 秒内与我的最近距离 ---
+    // --- 2) 躲子弹：预测每颗来袭炮弹未来 0.45 秒内与我的最近距离 ---
     bool dodge = false;
     Vec2 dodge_dir{0, 0};
     for (const auto& b : bullets_) {
@@ -517,7 +607,6 @@ void Game::update_ai(Tank& me, const Tank& foe, double dt) {
         const Vec2 miss = me.pos - closest;
         if (len(miss) < 46.0 && t < 0.45) {
             dodge = true;
-            // 朝"远离子弹轨迹"的方向走：取轨迹法线中与当前朝向夹角小的那个
             const Vec2 n = norm(Vec2{-b.vel.y, b.vel.x});
             const Vec2 fwd{std::cos(me.ang), std::sin(me.ang)};
             dodge_dir = (dot(n, miss) > 0) ? n : Vec2{-n.x, -n.y};
@@ -525,7 +614,7 @@ void Game::update_ai(Tank& me, const Tank& foe, double dt) {
         }
     }
 
-    // --- 2) 周期性重算瞄准误差与走位方向，避免每帧抖动（像人的反应时间）---
+    // --- 3) 周期性重掷：瞄准误差与绕行方向（像人的反应时间，而不是每帧抖动）---
     if (br.think <= 0) {
         br.think = reaction * (0.6 + (rng_() % 100) / 100.0);
         br.aim_err = ((double)(rng_() % 2001) / 1000.0 - 1.0) * aim_noise;
@@ -535,21 +624,83 @@ void Game::update_ai(Tank& me, const Tank& foe, double dt) {
         }
     }
 
-    // --- 3) 预判瞄准：用目标当前位置 + 速度外推一点 ---
+    // --- 4) 真预判：按子弹飞行时间把瞄准点外推到对手未来的位置 ---
     const Vec2 to_foe = foe.pos - me.pos;
     const double dist = len(to_foe);
-    const double lead = clampd(dist / cfg_.bullet_speed, 0.0, 0.35);
-    double want = std::atan2(to_foe.y, to_foe.x) + br.aim_err * std::min(1.0, lead * 4.0 + 0.35);
+    const double flight = dist / cfg_.bullet_speed;
+    Vec2 aim_pt = foe.pos;
+    if (use_lead) aim_pt = aim_pt + br.foe_vel * std::min(flight, 0.35);
+    const double noise_scale = std::min(1.0, std::max(0.0, flight) * 4.0 + 0.35);
+    const double want = std::atan2(aim_pt.y - me.pos.y, aim_pt.x - me.pos.x)
+                        + br.aim_err * noise_scale;
     double diff = want - me.ang;
     while (diff > M_PI) diff -= 2 * M_PI;
     while (diff < -M_PI) diff += 2 * M_PI;
 
-    // --- 4) 转向：比例控制（转得太快会像机器，所以加一点死区）---
+    // --- 5) BFS：网格上的"实际距离"和下一步方向（不是直线距离）---
+    br.path_cells = -1;
+    br.step_dir = Vec2{0, 0};
+    if (use_path) {
+        const int C = cfg_.cols, R = cfg_.rows;
+        const int mx = std::max(0, std::min(C - 1, (int)(me.pos.x / cfg_.cell)));
+        const int my = std::max(0, std::min(R - 1, (int)(me.pos.y / cfg_.cell)));
+        const int fx = std::max(0, std::min(C - 1, (int)(foe.pos.x / cfg_.cell)));
+        const int fy = std::max(0, std::min(R - 1, (int)(foe.pos.y / cfg_.cell)));
+        bfs_from(fx, fy, br.dist_grid);
+        if (br.dist_grid.size() == (size_t)C * R) {
+            br.path_cells = br.dist_grid[(size_t)my * C + mx];
+            if (br.path_cells > 0) {
+                int best = br.path_cells;
+                const int ddx[4] = {1, -1, 0, 0}, ddy[4] = {0, 0, 1, -1};
+                for (int d = 0; d < 4; ++d) {
+                    const int nx = mx + ddx[d], ny = my + ddy[d];
+                    if (nx < 0 || ny < 0 || nx >= C || ny >= R) continue;
+                    const int v = br.dist_grid[(size_t)ny * C + nx];
+                    if (v >= 0 && v < best) { best = v; br.step_dir = Vec2{(double)ddx[d], (double)ddy[d]}; }
+                }
+            }
+        }
+    }
+
+    // --- 6) 反弹射线：看不见对手时，找一条"最多 2 次反弹能命中"的方向 ---
+    const bool clear = line_clear(me.pos, foe.pos);
+    if (clear) br.bank_ok = false;          // 能直射就不打反弹球了
+    if (use_bank && br.aim_scan_t <= 0) {
+        br.aim_scan_t = 0.15;
+        br.bank_ok = false;
+        if (!clear) {
+            int best_b = 99;
+            double best_turn = 1e9;
+            for (int k = 0; k < 48; ++k) {
+                const double a = -M_PI + k * (2.0 * M_PI / 48.0);
+                const Vec2 d{std::cos(a), std::sin(a)};
+                int used = 0;
+                const double L = raycast(me.pos + d * (kTankR + 8.0), d, 2, aim_pt,
+                                         kTankR + kBulletR, 1400.0, &used);
+                if (L < 0) continue;
+                double dd = a - me.ang;
+                while (dd > M_PI) dd -= 2 * M_PI;
+                while (dd < -M_PI) dd += 2 * M_PI;
+                dd = std::fabs(dd);
+                if (used < best_b || (used == best_b && dd < best_turn)) {
+                    best_b = used; best_turn = dd; br.bank_ang = a; br.bank_ok = true;
+                }
+            }
+        }
+    }
+    if (br.bank_ok) {
+        diff = br.bank_ang - me.ang;
+        while (diff > M_PI) diff -= 2 * M_PI;
+        while (diff < -M_PI) diff += 2 * M_PI;
+    }
+
+    // --- 7) 转向：比例控制 + 死区 ---
     me.turn = clampd(diff * 2.6, -1.0, 1.0);
     if (std::fabs(diff) < 0.04) me.turn = 0;
 
-    // --- 5) 移动：远则推进、近则后退、中对峙绕行 ---
+    // --- 8) 移动：躲弹 > 沿 BFS 最短路 > 远推进 / 近后退 / 中距离绕行 ---
     const Vec2 fwd{std::cos(me.ang), std::sin(me.ang)};
+    const double eff_dist = (use_path && br.path_cells > 0) ? br.path_cells * cfg_.cell : dist;
     if (dodge) {
         const double d = std::atan2(dodge_dir.y, dodge_dir.x);
         double dd = d - me.ang;
@@ -559,33 +710,50 @@ void Game::update_ai(Tank& me, const Tank& foe, double dt) {
         me.drive = (std::fabs(dd) < 1.0) ? 1.0 : 0.0;
     } else if (!foe.alive) {
         me.drive = 0;
-    } else if (dist > 300) {
+    } else if (br.bank_ok && std::fabs(diff) < 0.6) {
+        me.drive = 0;                       // 已经瞄准反弹点，站定打这一杆
+    } else if (use_path && !clear && (br.step_dir.x != 0 || br.step_dir.y != 0)) {
+        const double d = std::atan2(br.step_dir.y, br.step_dir.x);
+        double dd = d - me.ang;
+        while (dd > M_PI) dd -= 2 * M_PI;
+        while (dd < -M_PI) dd += 2 * M_PI;
+        me.turn = clampd(dd * 3.0, -1.0, 1.0);
+        me.drive = (std::fabs(dd) < 1.1) ? 1.0 : 0.0;
+    } else if (eff_dist > 300) {
         me.drive = (std::fabs(diff) < 0.9) ? 1.0 : 0.0;
-    } else if (dist < 130) {
+    } else if (eff_dist < 130) {
         me.drive = -0.8;
     } else {
         me.drive = (std::fabs(diff) < 1.2) ? 0.7 : 0.0;
         me.turn = clampd(me.turn + br.strafe_dir * 0.45, -1.0, 1.0);
     }
 
-    // --- 6) 开炮：对准了就开火；能看到对手时更谨慎，看不到时大胆打反弹球 ---
-    const bool clear = line_clear(me.pos, foe.pos);
-    const bool aimed = std::fabs(diff) < (0.10 + 0.05 * (1.0 - lvl));
-    // 炮口贴墙时开火几乎必然打到自己，禁止这种自杀行为
+    // --- 9) 开炮：对准 + 炮口不贴墙 + 反应时间 +（直射 / 近距离盲射 / 反弹命中）+ 不自伤 ---
+    const bool aimed = std::fabs(diff) < (0.10 + 0.05 * (2 - lvl));   // 0.15 / 0.10 / 0.05
     const Vec2 muzzle = me.pos + fwd * (kTankR + kBulletR + 3.0);
     const int mx = (int)(muzzle.x / cfg_.cell), my = (int)(muzzle.y / cfg_.cell);
     bool muzzle_blocked = false;
     if (mx < 0 || my < 0 || mx >= cfg_.cols || my >= cfg_.rows) muzzle_blocked = true;
     else if (cells_[(size_t)my * cfg_.cols + mx]) muzzle_blocked = true;
 
+    // 自伤风险：模拟这一发球（含反弹）1 秒内的轨迹，若会扫过自己就放弃
+    br.self_harm = false;
+    if (use_self && !muzzle_blocked) {
+        int used = 0;
+        const double L = raycast(muzzle, fwd, cfg_.max_bounces, me.pos,
+                                 kTankR + kBulletR, cfg_.bullet_speed * 1.0, &used);
+        br.self_harm = (L >= 0);
+    }
+
     const bool may_fire = aimed && !muzzle_blocked && br.fire_delay <= 0 &&
-                          (clear || dist < 260);
+                          (clear || dist < 260 || br.bank_ok) && !br.self_harm;
     if (may_fire && me.live_bullets < kMaxBullets) {
+        if (br.bank_ok) ++bank_shots_;
         me.want_fire = true;
         br.fire_delay = reaction * (0.8 + (rng_() % 60) / 100.0);
     }
 
-    // --- 7) 脱困动作优先于上面所有决策：原地转向并后退，同时不开炮 ---
+    // --- 10) 脱困动作优先级最高：原地转向并后退，同时禁火 ---
     if (br.unstick_t > 0) {
         br.unstick_t -= dt;
         me.turn = br.unstick_dir;
